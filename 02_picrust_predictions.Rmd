@@ -1,0 +1,981 @@
+---
+title: "Untitled"
+output: html_document
+date: "2025-09-03"
+---
+
+# Packages and and scripts
+
+```{r}
+library(phyloseq)
+library(vegan)
+library(plyr)
+library(ape)
+library(microbiome)
+library(reshape2)
+library(magrittr)
+library(dplyr)
+library(ggpubr)
+library(ComplexHeatmap)
+library(microViz)
+library(ShortRead)
+library(phyloseq)
+library(plyr)
+library(ggpubr)
+library(plotly)
+library(multcomp)
+library(BiodiversityR)
+library(biomformat)
+
+small_fig<-function(GG){
+  GG+theme(axis.title = element_text(size=8),
+           axis.text = element_text(size=6),
+           plot.title=element_text(size=8),
+           legend.text = element_text(size=8),
+           legend.key.size = unit(0.5,"line"))
+}
+
+
+make_hover_text <- function(df, exclude = c("x","y"), collapse = "<br>") {
+  # ensure df is a data.frame
+  df <- as.data.frame(df)
+  cols <- setdiff(colnames(df), exclude)
+  # create safe character representation for each cell
+  cell_str <- function(x) {
+    # avoid factors
+    if (is.factor(x)) x <- as.character(x)
+    # convert NA to string
+    ifelse(is.na(x), "<i>NA</i>", as.character(x))
+  }
+  # build per-row html
+  hover <- apply(df[ , cols, drop = FALSE], 1, function(row) {
+    paste0(paste0(cols, ": ", cell_str(row)), collapse = collapse)
+  })
+  hover
+}
+
+
+prepare_tax_df<-function(PHYLOSEQ,RANK,Unass.symbol=NA,Unass.repl,
+                         min_prop,top_tax,bellow_top,
+                         merge_categories,prop.trans,sort_abu){
+if(prop.trans==T){PHYLOSEQ=transform_sample_counts(PHYLOSEQ,function(x) x/sum(x))}
+TT<-tax_table(PHYLOSEQ)
+class(TT)<-"matrix"
+TT[is.na(tax_table(TT))]<-Unass.repl
+TT<-tax_table(TT)
+tax_table(PHYLOSEQ)<-TT
+
+PHYLOSEQ.merged<-tax_glom(PHYLOSEQ,taxrank=RANK)
+PHYLOSEQ.merged=transform_sample_counts(PHYLOSEQ.merged,function(x) x/sum(x))
+
+#select top taxa
+NAMES<-as.character(tax_table(PHYLOSEQ.merged)[,RANK])
+TS<-taxa_sums(PHYLOSEQ.merged)
+names(TS)<-NAMES
+TS<-rev(sort(TS))
+KEEP<-names(TS)[1:top_tax]
+
+#
+TT<-tax_table(PHYLOSEQ.merged)
+class(TT)<-"matrix"
+TT[,RANK][!TT[,RANK]%in%KEEP]<-bellow_top
+TT<-tax_table(TT)
+tax_table(PHYLOSEQ.merged)<-TT
+PHYLOSEQ.merged<-tax_glom(PHYLOSEQ.merged,taxrank=RANK)
+
+mdf = psmelt(PHYLOSEQ.merged)
+
+if(sort_abu==T){
+  mdf[,RANK]<-as.factor(mdf[,RANK])
+  ADD<-levels(mdf[,RANK])[!levels(mdf[,RANK])%in%KEEP]
+  if(length(ADD)>0){mdf[,RANK]<-factor(mdf[,RANK],levels=c(KEEP,ADD))}
+  if(length(ADD)==0){mdf[,RANK]<-factor(mdf[,RANK],levels=c(KEEP))}
+}
+
+mdf
+}
+
+
+
+
+```
+
+
+# 16S data used for predictions  
+
+```{r}
+#phyloseg
+load("data/PHS.rodents.ASV_Meta_Decont.R")
+taxa_names(PHS)<-gsub("ASV_","ASV.",taxa_names(PHS))
+taxa_names(PHS)<-sapply(strsplit(taxa_names(PHS), "_"), function(x) x[1], simplify=T)
+
+View(data.frame(tax_table(PHS)))
+
+```
+
+# Install picrust2.6
+
+```{r}
+# 
+# # make sure channels are correct (order: conda-forge, bioconda)
+# conda config --remove-key channels || true
+# conda config --add channels conda-forge
+# conda config --add channels bioconda
+# conda config --set channel_priority strict
+# 
+# # use mamba to create the environment with the known-good Python
+# mamba create -n picrust2.6 picrust2=2.6.2 python=3.9 -c conda-forge -c bioconda -y
+# 
+# # activate and test
+# conda activate picrust2.6
+# picrust2_pipeline.py -h
+```
+
+
+
+
+# Prepare files for picrust, run picrist analyses and create phyloseq with predicted pathways
+
+```{r}
+# #save ASVs sequences as fasta
+# REFS<-refseq(PHS)
+# writeFasta(REFS,file = "~/data/PNG_bact/PICRUST_26/REF.fasta")
+# 
+# 
+# #save ASVs abundance matrix as a tab delim file
+# otu <- otu_table(PHS) 
+# if (!taxa_are_rows(otu)) {
+#   otu <- t(otu)
+# }
+# biom_obj <- make_biom(data = as.matrix(otu))
+# write_biom(biom_obj, "~/data/PNG_bact/PICRUST_26/otu_table_picrust2.biom")
+# 
+# #PCRUST RUN
+# # conda activate picrust2.6
+# # picrust2_pipeline.py -s REF.fasta -i otu_table_picrust2.biom -o picrust2_out_pipeline -p 1
+# # add_descriptions.py -i pathways_out/path_abun_unstrat.tsv.gz -m METACYC -o pathways_out/path_abun_unstrat_descrip.tsv.gz
+# # add_descriptions.py -i EC_metagenome_out/pred_metagenome_unstrat.tsv.gz -m EC -o EC_metagenome_out/pred_metagenome_unstrat_descrip.tsv.gz
+# 
+# ##########################################
+# #Convert EC predictions to phyloseq#######
+# ##########################################
+# 
+# EC<-read.delim("~/data/PNG_bact/PICRUST_26/picrust2_out_pipeline/EC_metagenome_out/pred_metagenome_unstrat_descrip.tsv.gz")
+# 
+# #convert descriptions to the tax_table
+# EC.tax<-EC[,1:2]
+# EC.tax<-tax_table(EC.tax)
+# EC.names<-EC[,1]
+# taxa_names(EC.tax)<-EC.names
+# 
+# #convert the rest of the table to the otu_table()
+# EC.otu<-EC[,3:dim(EC)[2]]
+# EC.otu<-round(EC.otu,0)
+# EC.otu<-otu_table(EC.otu,taxa_are_rows = T)
+# taxa_names(EC.otu)<-EC.names
+# 
+# PHS.pic_EC<-merge_phyloseq(EC.otu,EC.tax,sample_data(PHS))
+# save(PHS.pic_EC,file = "~/data/PNG_bact/PICRUST_26/PHS.pic_EC_v2.R")
+# 
+# 
+# ##########################################
+# #Convert paTHWAYT predictions to phyloseq#######
+# ##########################################
+# 
+# EC<-read.delim("~/data/PNG_bact/PICRUST_26/picrust2_out_pipeline/pathways_out/path_abun_unstrat_descrip.tsv.gz")
+# 
+# #convert descriptions to the tax_table
+# EC.tax<-EC[,1:2]
+# EC.tax<-tax_table(EC.tax)
+# EC.names<-EC[,1]
+# taxa_names(EC.tax)<-EC.names
+# 
+# #convert the rest of the table to the otu_table()
+# EC.otu<-EC[,3:dim(EC)[2]]
+# EC.otu<-round(EC.otu,0)
+# EC.otu<-otu_table(EC.otu,taxa_are_rows = T)
+# taxa_names(EC.otu)<-EC.names
+# 
+# #merge these objects with original metadata and save
+# #merge these objects with original metadata and save
+# # sample_names(Schmiedova_2202_CAR)<-paste0("X",sample_names(Schmiedova_2202_CAR))
+# # sample_names(PHYLOSEQ_Alena)<-gsub("-",".",sample_names(PHYLOSEQ_Alena))
+# PHS.pic_path<-merge_phyloseq(EC.otu,EC.tax,sample_data(PHS))
+# save(PHS.pic_path,file = "~/data/PNG_bact/PICRUST_26/PHS.pic_path_v2.R")
+
+```
+
+
+# NSTI summary
+
+```{r}
+DAT<-read.delim("data/weighted_nsti.tsv.gz")
+
+head(DAT)
+
+summary(DAT$weighted_NSTI)
+```
+
+
+
+# Betadiversity - Hydromymni vs. endemic Rattini vs. invasive Rattus
+
+
+
+```{r}
+load("data/PHS.pic_path_v2.R")
+# PHS.pic_path.tr<-transform_sample_counts(PHS.pic_EC,function(x) x/sum(x)) #EC gene families
+PHS.pic_path.tr<-transform_sample_counts(PHS.pic_path,function(x) x/sum(x)) 
+BC<-vegdist(t(otu_table(PHS.pic_path.tr)^0.5))
+
+#sample data
+SD<-sample_data(PHS.pic_path.tr)
+class(SD)<-"data.frame"
+
+names(SD)
+KEEP<-c("Species_consensus_ddRAD_mt_others","Tribe.2",
+        "Metalokalita","Alt","Ecological_ensembles")
+SD<-SD[,KEEP]
+SD[rowSums(is.na(SD))>0,]
+unique(SD$Metalokalita)
+SD$Metalokalita[SD$Metalokalita%in%c("Nagada","Wanang","Baitabag")]<-"Mt_Wilhelm"
+
+
+####adonis +nested.anova.dbrda
+#adonis2(BC~Species_consensus_ddRAD_mt_others,SD)
+
+# SD$Species_consensus_ddRAD_mt_others<-as.factor(SD$Species_consensus_ddRAD_mt_others)
+# SD$Tribe.2<-as.factor(SD$Tribe.2)
+# NDB<-nested.anova.dbrda(BC~Tribe.2+Species_consensus_ddRAD_mt_others,data = SD,permutations=1)
+# NDB
+
+
+```
+
+# PCoA  - Hydromymni vs. endemic Rattini vs. invasive Rattus
+
+```{r}
+
+ORD.bc<-ordinate(PHS.pic_path.tr,distance = BC,method = "PCoA")
+BC.pcoa<-plot_ordination(PHS.pic_path.tr,ORD.bc,color = "Tribe.2",axes = c(1,2))
+BC.pcoa
+
+
+redraw<-function(x){
+  #x<-BC.pcoa
+  x$layers[[1]]<-NULL
+  x=x+geom_point(size=1, alpha = 0.3)
+  x=x+theme_bw()
+  x=small_fig(x)+theme(legend.title = element_blank())
+  x
+}
+
+
+BC.pcoa.2<-redraw(BC.pcoa)+scale_color_brewer(palette = "Dark2")
+BC.pcoa.2<-BC.pcoa.2+xlab("PCoA.1 [41.7%]")+ylab("PCoA.2 [11.2%]")
+
+ggsave(BC.pcoa.2+theme(legend.position = "bottom"),
+       filename = "results/PCoA_3G_pic.pdf",width = 8, height = 8, units = "cm")
+
+```
+
+# LinDa - Hydromymni vs. endemic Rattini vs. invasive Rattus
+
+```{r fig.width=12, fig.height=16}
+
+library(MicrobiomeStat)
+
+PHS.g_H.nR<-prune_samples(sample_data(PHS.pic_path)$Tribe.2%in%c("Hydromyini","native Rattini"),PHS.pic_path)
+PHS.g_H.iR<-prune_samples(sample_data(PHS.pic_path)$Tribe.2%in%c("Hydromyini","invasive Rattini"),PHS.pic_path)
+PHS.g_iR.nR<-prune_samples(sample_data(PHS.pic_path)$Tribe.2%in%c("invasive Rattini","native Rattini"),PHS.pic_path)
+
+PHS.g_H.nR.t<-transform_sample_counts(PHS.g_H.nR,function(x) x/sum(x))
+PHS.g_H.iR.t<-transform_sample_counts(PHS.g_H.iR,function(x) x/sum(x))
+PHS.g_iR.nR.t<-transform_sample_counts(PHS.g_iR.nR,function(x) x/sum(x))
+
+
+###################
+# Hydro x Native R#
+###################
+#PHS.g_H.nR<-transform_sample_counts(PHS.g_H.nR,function(x) x/sum(x))
+taxa_table<-data.frame(t(otu_table(PHS.g_H.nR.t)))
+metadata<-data.frame(sample_data(PHS.g_H.nR.t))
+
+class(taxa_table)<-"data.frame"
+class(metadata)<-"data.frame"
+
+rownames(taxa_table)<-sample_names(PHS.g_H.nR.t)
+rownames(metadata)<-sample_names(PHS.g_H.nR.t)
+
+metadata$Tribe.2<-as.factor(metadata$Tribe.2)
+metadata$Species_consensus_ddRAD_mt_others<-as.factor(metadata$Species_consensus_ddRAD_mt_others)
+metadata$Run<-as.factor(metadata$Run)
+metadata$Locality<-as.factor(metadata$Locality)
+
+Linda_H.nR.G<-
+  linda(
+    feature.dat=t(as.matrix(taxa_table)),
+    meta.dat=metadata,
+    formula="~Run+Tribe.2+(1|Species_consensus_ddRAD_mt_others)+(1|Locality)",
+    feature.dat.type = c('proportion'),
+    prev.filter = 0.1,
+    mean.abund.filter = 0.0001, 
+    max.abund.filter = 0,
+    is.winsor = F,
+    outlier.pct = 0.03,
+    adaptive = TRUE,
+    zero.handling = c('pseudo-count', 'imputation'),
+    pseudo.cnt = 0.5,
+    corr.cut = 0.1,
+    p.adj.method = "BH",
+    alpha = 0.05,
+    n.cores = 1, 
+    verbose = TRUE
+  )
+
+#####################
+# Hydro x invasive R#
+#####################
+#PHS.g_H.iR<-transform_sample_counts(PHS.g_H.iR,function(x) x/sum(x))
+taxa_table<-data.frame(t(otu_table(PHS.g_H.iR.t)))
+metadata<-data.frame(sample_data(PHS.g_H.iR.t))
+
+class(taxa_table)<-"data.frame"
+class(metadata)<-"data.frame"
+
+rownames(taxa_table)<-sample_names(PHS.g_H.iR.t)
+rownames(metadata)<-sample_names(PHS.g_H.iR.t)
+
+metadata$Tribe.2<-as.factor(metadata$Tribe.2)
+metadata$Species_consensus_ddRAD_mt_others<-as.factor(metadata$Species_consensus_ddRAD_mt_others)
+metadata$Run<-as.factor(metadata$Run)
+metadata$Locality<-as.factor(metadata$Locality)
+
+Linda_H.iR.G<-
+  linda(
+    feature.dat=t(as.matrix(taxa_table)),
+    meta.dat=metadata,
+    formula="~Run+Tribe.2+(1|Species_consensus_ddRAD_mt_others)+(1|Locality)",
+    feature.dat.type = c('proportion'),
+    prev.filter = 0.1,
+    mean.abund.filter = 0.0001, 
+    max.abund.filter = 0,
+    is.winsor = F,
+    outlier.pct = 0.03,
+    adaptive = TRUE,
+    zero.handling = c('pseudo-count', 'imputation'),
+    pseudo.cnt = 0.5,
+    corr.cut = 0.1,
+    p.adj.method = "BH",
+    alpha = 0.05,
+    n.cores = 1, 
+    verbose = TRUE
+  )
+
+######################
+# native x invasive R#
+######################
+#PHS.g_iR.nR<-transform_sample_counts(PHS.g_iR.nR,function(x) x/sum(x))
+taxa_table<-data.frame(t(otu_table(PHS.g_iR.nR.t)))
+metadata<-data.frame(sample_data(PHS.g_iR.nR.t))
+
+class(taxa_table)<-"data.frame"
+class(metadata)<-"data.frame"
+
+rownames(taxa_table)<-sample_names(PHS.g_iR.nR.t)
+rownames(metadata)<-sample_names(PHS.g_iR.nR.t)
+
+metadata$Tribe.2<-as.factor(metadata$Tribe.2)
+metadata$Species_consensus_ddRAD_mt_others<-as.factor(metadata$Species_consensus_ddRAD_mt_others)
+metadata$Run<-as.factor(metadata$Run)
+metadata$Locality<-as.factor(metadata$Locality)
+
+Linda_iR.nR.G<-
+  linda(
+    feature.dat=t(as.matrix(taxa_table)),
+    meta.dat=metadata,
+    formula="~Run+Tribe.2+(1|Species_consensus_ddRAD_mt_others)+(1|Locality)",
+    feature.dat.type = c('proportion'),
+    prev.filter = 0.1,
+    mean.abund.filter = 0.0001, 
+    max.abund.filter = 0,
+    is.winsor = F,
+    outlier.pct = 0.03,
+    adaptive = TRUE,
+    zero.handling = c('pseudo-count', 'imputation'),
+    pseudo.cnt = 0.5,
+    corr.cut = 0.1,
+    p.adj.method = "BH",
+    alpha = 0.05,
+    n.cores = 1, 
+    verbose = TRUE
+  )
+
+RES_H.nR.G<-Linda_H.nR.G$output[[2]]
+RES_H.iR.G<-Linda_H.iR.G$output[[2]]
+RES_iR.nR.G<-Linda_iR.nR.G$output[[2]]
+
+# hist(RES_H.nR.G$log2FoldChange)
+# hist(RES_H.iR.G$log2FoldChange)
+# hist(RES_iR.nR.G$log2FoldChange)
+
+sum(RES_H.nR.G$padj<0.05&abs(RES_H.nR.G$log2FoldChange)>0)
+sum(RES_H.iR.G$padj<0.05&abs(RES_H.iR.G$log2FoldChange)>0)
+sum(RES_iR.nR.G$padj<0.05&abs(RES_iR.nR.G$log2FoldChange)>0)
+
+sum(RES_H.nR.G$padj<0.05&RES_H.nR.G$log2FoldChange>0)
+sum(RES_H.nR.G$padj<0.05&RES_H.nR.G$log2FoldChange<0)
+
+sum(RES_H.iR.G$padj<0.05&abs(RES_H.iR.G$log2FoldChange)>0)
+
+sum(RES_iR.nR.G$padj<0.05&RES_iR.nR.G$log2FoldChange>0)
+sum(RES_iR.nR.G$padj<0.05&RES_iR.nR.G$log2FoldChange<0)
+
+sum(RES_H.nR.G$padj<0.05&abs(RES_H.nR.G$log2FoldChange)>2)
+sum(RES_H.iR.G$padj<0.05&abs(RES_H.iR.G$log2FoldChange)>2)
+sum(RES_iR.nR.G$padj<0.05&abs(RES_iR.nR.G$log2FoldChange)>2)
+
+SIG_H.nR.G<-rownames(RES_H.nR.G)[RES_H.nR.G$padj<0.05&abs(RES_H.nR.G$log2FoldChange)>0]
+SIG_H.iR.G<-rownames(RES_H.iR.G)[RES_H.iR.G$padj<0.05&abs(RES_H.iR.G$log2FoldChange)>0]
+SIG_iR.nR.G<-rownames(RES_iR.nR.G)[RES_iR.nR.G$padj<0.05&abs(RES_iR.nR.G$log2FoldChange)>0]
+
+SIG_iR.nR.G%in%SIG_H.nR.G
+
+TEST<-RES_H.nR.G[RES_H.nR.G$padj<0.05,]
+TEST$log2FoldChange
+
+SIG<-unique(c(SIG_H.nR.G,SIG_H.iR.G,SIG_iR.nR.G))
+SIG<-gsub("^X","",SIG)
+SIG<-gsub("[.]","-",SIG)
+
+
+```
+
+# Correlation of resulting log2 fold changes 
+
+
+```{r}
+RN<-c(rownames(RES_H.nR.G),rownames(RES_H.iR.G),rownames(RES_iR.nR.G))
+RN.t<-table(RN)
+RN.t<-RN.t[RN.t==3]
+
+RES_H.nR.G.sel<-RES_H.nR.G[names(RN.t),]
+RES_H.iR.G.sel<-RES_H.iR.G[names(RN.t),]
+RES_iR.nR.G.sel<-RES_iR.nR.G[names(RN.t),]
+
+rownames(RES_H.nR.G.sel)==rownames(RES_H.iR.G.sel)
+
+plot(RES_H.nR.G.sel$log2FoldChange,RES_H.iR.G.sel$log2FoldChange)
+plot(RES_H.nR.G.sel$log2FoldChange,RES_iR.nR.G.sel$log2FoldChange)
+cor.test(RES_H.nR.G.sel$log2FoldChange,RES_iR.nR.G.sel$log2FoldChange,method = "spearman")
+cor.test(RES_H.nR.G.sel$log2FoldChange,RES_H.iR.G.sel$log2FoldChange,method = "spearman")
+  
+
+```
+
+
+
+# Linda vizulaization - Hydromymni vs. endemic Rattini vs. invasive Rattus
+
+```{r}
+TT<-tax_table(PHS.pic_path)
+TT<-data.frame(TT)
+head(TT)
+
+SIG_H.nR.G.2<-rownames(RES_H.nR.G)[RES_H.nR.G$padj<0.05&abs(RES_H.nR.G$log2FoldChange)>0]
+SIG_H.iR.G.2<-rownames(RES_H.iR.G)[RES_H.iR.G$padj<0.05&abs(RES_H.iR.G$log2FoldChange)>0]
+SIG_iR.nR.G.2<-rownames(RES_iR.nR.G)[RES_iR.nR.G$padj<0.05&abs(RES_iR.nR.G$log2FoldChange)>0]
+
+
+SIG<-unique(c(SIG_H.nR.G.2,SIG_H.iR.G.2,SIG_iR.nR.G.2))
+# SIG<-gsub("^X","",SIG)
+# SIG<-gsub("[.]","-",SIG)
+
+RES_H.nR.G.2<-RES_H.nR.G
+RES_H.iR.G.2<-RES_H.iR.G
+RES_iR.nR.G.2<-RES_iR.nR.G
+
+RES_H.nR.G.2$ta1<-rownames(RES_H.nR.G.2)
+RES_H.iR.G.2$ta1<-rownames(RES_H.iR.G.2)
+RES_iR.nR.G.2$ta1<-rownames(RES_iR.nR.G.2)
+
+RES_H.nR.G.2$Contrast<-"Hydromiini x native Rattini"
+RES_H.iR.G.2$Contrast<-"Hydromiini x invasive Rattus"
+RES_iR.nR.G.2$Contrast<-"invasive Rattus x native Rattini"
+
+RES_H.nR.G.2<-RES_H.nR.G.2[RES_H.nR.G.2$ta1%in%SIG,]
+RES_H.iR.G.2<-RES_H.iR.G.2[RES_H.iR.G.2$ta1%in%SIG,]
+RES_iR.nR.G.2<-RES_iR.nR.G.2[RES_iR.nR.G.2$ta1%in%SIG,]
+
+
+RES.sub<-rbind(RES_H.nR.G.2,RES_H.iR.G.2,RES_iR.nR.G.2)
+
+RES.sub$ta1<-gsub("^X","",RES.sub$ta1)
+RES.sub$ta1<-gsub("[.]","-",RES.sub$ta1)
+
+RES.sub<-join(RES.sub,TT)
+RES.sub$sig<-ifelse(RES.sub$padj<0.05,"s","ns")
+RES.sub<-RES.sub[RES.sub$padj<0.05,]
+
+RES.sub <- RES.sub[order(RES.sub$log2FoldChange),]
+
+LEV<-RES.sub$ta2
+LEV<-gsub("superpathway of ","",LEV)
+RES.sub$ta2<-LEV
+LEV<-LEV[duplicated(LEV)==F]
+RES.sub$ta2<-factor(RES.sub$ta2,levels=LEV)
+
+GG<-
+ggplot(RES.sub,aes(x=ta2,y=log2FoldChange))+
+  geom_errorbar(aes(ymin =  log2FoldChange - 2*lfcSE, ymax = log2FoldChange + 2*lfcSE), width = 0.1,alpha=0.5)+
+  geom_point(size = 2,alpha=0.5)+facet_grid(.~Contrast,space="free",scales="free")
+
+GG.s<-small_fig(GG+theme_bw())
+GG.s<-
+GG.s+theme(axis.text.x = element_text(angle = 90, hjust = 1),
+           axis.title.x = element_blank(),
+           strip.text = element_text(size=8))
+
+ggsave(GG.s+coord_flip(),filename="results/DA_pic.pdf",width = 18,height = 20,units = "cm")
+
+GG.s+coord_flip()
+```
+
+# Prepare phylogeny for Hydromyni
+
+all Rattus species excluded
+
+```{r}
+tree<-read.tree("data/Joined_scaled_RH85_corrected.nwk")
+#plot(tree)
+
+
+tree$tip.label[!tree$tip.label%in%sample_names(PHS)]
+sample_names(PHS)[!sample_names(PHS)%in%tree$tip.label]
+is.rooted(tree)
+
+EXCLUDE<-tree$tip.label[!tree$tip.label%in%sample_names(PHS)]
+length(tree$tip.label)
+tree<-drop.tip(tree,EXCLUDE)
+
+PHS.sub<-prune_samples(sample_names(PHS.pic_path)%in%tree$tip.label,PHS.pic_path)
+length(unique(sample_data(PHS.sub)$Species_consensus_ddRAD_mt_others))
+length(unique(sample_data(PHS)$Species_consensus_ddRAD_mt_others))
+sum(!tree$tip.label%in%sample_names(PHS.sub))
+
+#unikatni vzorky
+PHS.sub.unq<-prune_samples(!duplicated(sample_data(PHS.sub)$Species_consensus_ddRAD_mt_others),PHS.sub)
+EXCLUDE<-tree$tip.label[!tree$tip.label%in%sample_names(PHS.sub.unq)]
+tree.sp<-drop.tip(tree,EXCLUDE)
+plot(tree.sp)
+
+#Hydrominyi tree
+EXCLUDE<-tree.sp$tip.label[grep("Rattus",tree.sp$tip.label)]
+EXCLUDE
+tree.sp.h<-drop.tip(tree.sp,EXCLUDE)
+plot(tree.sp.h)
+# tree.sp.h$tip.label
+
+
+
+###
+```
+
+
+# NMDS for Hydromys species
+
+
+```{r fig.height=12, fig.width=8}
+
+####SUBSET
+library(ggrepel)
+PHS.h<-prune_samples(sample_data(PHS.pic_path)$Tribe.2=="Hydromyini",PHS.pic_path)
+PHS.h<-prune_samples(sample_data(PHS.h)$Species_consensus_ddRAD_mt_others!="Pseudohydromys sp. indet.",PHS.h)
+
+PHS.t<-transform_sample_counts(PHS.h,function(x) x/sum(x))
+
+########
+#phyloseq for Hydro..
+
+#intersect phygenetivc tree x phyloseq
+tree.sp.h$tip.label<-gsub("^[A-Z]*[0-9]*[.][0-9]*_","",tree.sp.h$tip.label)
+tree.sp.h$tip.label[(!tree.sp.h$tip.label%in%sample_names(PHS.t))]
+EXCLUDE<-sample_names(PHS.t)[!(sample_names(PHS.t)%in%tree.sp.h$tip.label)]
+# PHS.t<-prune_samples(!sample_names(PHS.t)%in%EXCLUDE,PHS.t)
+
+HYDRO.p.unq<-tree.sp.h
+HYDRO.p.unq.u <- phytools::force.ultrametric(HYDRO.p.unq, method="nnls")
+
+####PCoA - Bray Curtis  
+PHS.t.spec<-merge_samples(PHS.t,group="Species_consensus_ddRAD_mt_others")
+SD<-sample_data(PHS.t)
+SD.unq<-SD[duplicated(SD$Species_consensus_ddRAD_mt_others)==F,]
+sample_names(SD.unq)<-SD.unq$Species_consensus_ddRAD_mt_others
+PHS.t.spec.t<-transform_sample_counts(PHS.t.spec,function(x) x/sum(x))
+sample_names(PHS.t.spec.t)<-gsub(" ",".",sample_names(PHS.t.spec.t))
+sample_names(SD.unq)<-gsub(" ",".",sample_names(SD.unq))
+
+sample_data(PHS.t.spec.t)<-SD.unq
+
+#####################
+## Ordination etc..##
+#####################
+BC<-vegdist((otu_table(PHS.t.spec.t)^0.5))
+Bray<-BC
+
+
+ORD<-ordinate(PHS.t.spec.t,distance = BC,method = "NMDS")
+ORD.df<-plot_ordination(PHS.t.spec.t,ORD,justDF = T)
+ORD.df$Species<-gsub("mys",".",ORD.df$Species)
+ORD.df$Genus<-sapply(strsplit(ORD.df$Species_consensus_ddRAD_mt_others, " "), function(x) x[1], simplify=FALSE)
+ORD.df$Genus<-gsub("mys",".",ORD.df$Genus)
+
+PL.diet.bc<-ggplot(ORD.df,aes(x=NMDS1,y=NMDS2,color=Diet))+ geom_text(aes(label=Genus),size=1.5)
+PL.strat.bc<-ggplot(ORD.df,aes(x=NMDS1,y=NMDS2,color=Strata))+geom_point()
+PL.bw.bc<-ggplot(ORD.df,aes(x=NMDS1,y=NMDS2,color=Body_mass))+geom_point()
+
+
+small_fig2<-function(GG){
+  GG+theme(axis.title = element_text(size=8),
+           axis.text = element_text(size=6),
+           plot.title=element_blank(),
+           legend.title = element_blank(),
+           legend.text = element_text(size=6))
+}
+
+PL.diet.bc.2<-small_fig2(PL.diet.bc+theme_bw())
+PL.strat.bc.2<-small_fig2(PL.strat.bc+theme_bw())
+PL.bw.bc.2<-small_fig2(PL.bw.bc+theme_bw())
+
+Grid.bc<-
+ggarrange(PL.diet.bc.2+theme(legend.position = "bottom")+ggtitle("A)"),
+          PL.strat.bc.2+theme(legend.position = "bottom")+ggtitle("B)"),
+          PL.bw.bc.2+theme(legend.position = "bottom")+ggtitle("C)"),
+          nrow = 3)
+
+ggsave(Grid.bc,file="results/Beta_bc_pic.pdf",width = 8, height=18,units="cm")
+
+Grid.bc
+
+```
+
+# PCoA for Hydromys species
+
+
+```{r fig.height=12, fig.width=8}
+
+####SUBSET
+library(ggrepel)
+PHS.h<-prune_samples(sample_data(PHS.pic_path)$Tribe.2=="Hydromyini",PHS.pic_path)
+PHS.h<-prune_samples(sample_data(PHS.h)$Species_consensus_ddRAD_mt_others!="Pseudohydromys sp. indet.",PHS.h)
+
+PHS.t<-transform_sample_counts(PHS.h,function(x) x/sum(x))
+
+########
+#phyloseq for Hydro..
+
+#intersect phygenetivc tree x phyloseq
+tree.sp.h$tip.label<-gsub("^[A-Z]*[0-9]*[.][0-9]*_","",tree.sp.h$tip.label)
+tree.sp.h$tip.label[(!tree.sp.h$tip.label%in%sample_names(PHS.t))]
+EXCLUDE<-sample_names(PHS.t)[!(sample_names(PHS.t)%in%tree.sp.h$tip.label)]
+# PHS.t<-prune_samples(!sample_names(PHS.t)%in%EXCLUDE,PHS.t)
+
+HYDRO.p.unq<-tree.sp.h
+HYDRO.p.unq.u <- phytools::force.ultrametric(HYDRO.p.unq, method="nnls")
+
+####PCoA - Bray Curtis  
+PHS.t.spec<-merge_samples(PHS.t,group="Species_consensus_ddRAD_mt_others")
+SD<-sample_data(PHS.t)
+SD.unq<-SD[duplicated(SD$Species_consensus_ddRAD_mt_others)==F,]
+sample_names(SD.unq)<-SD.unq$Species_consensus_ddRAD_mt_others
+PHS.t.spec.t<-transform_sample_counts(PHS.t.spec,function(x) x/sum(x))
+sample_names(PHS.t.spec.t)<-gsub(" ",".",sample_names(PHS.t.spec.t))
+sample_names(SD.unq)<-gsub(" ",".",sample_names(SD.unq))
+
+sample_data(PHS.t.spec.t)<-SD.unq
+
+#####################
+## Ordination etc..##
+#####################
+BC<-vegdist((otu_table(PHS.t.spec.t)^0.5))
+Bray<-BC
+
+
+ORD<-ordinate(PHS.t.spec.t,distance = BC,method = "PCoA")
+ORD.df<-plot_ordination(PHS.t.spec.t,ORD,justDF = T)
+ORD.df$Species<-gsub("mys",".",ORD.df$Species)
+ORD.df$Genus<-sapply(strsplit(ORD.df$Species_consensus_ddRAD_mt_others, " "), function(x) x[1], simplify=FALSE)
+ORD.df$Genus<-gsub("mys",".",ORD.df$Genus)
+
+PL.diet.bc<-ggplot(ORD.df,aes(x=Axis.1,y=Axis.2,color=Diet))+ geom_text(aes(label=Genus),size=1.5)
+PL.strat.bc<-ggplot(ORD.df,aes(x=Axis.1,y=Axis.2,color=Strata))+geom_point()
+PL.bw.bc<-ggplot(ORD.df,aes(x=Axis.1,y=Axis.2,color=Body_mass))+geom_point()
+
+PL.diet.bc<-PL.diet.bc+xlab("PCoA.1 [31.2%]")+xlab("PCoA.2 [15.3%]")
+PL.strat.bc<-PL.strat.bc+xlab("PCoA.1 [31.2%]")+xlab("PCoA.2 [15.3%]")
+PL.bw.bc<-PL.bw.bc+xlab("PCoA.1 [31.2%]")+xlab("PCoA.2 [15.3%]")
+
+small_fig2<-function(GG){
+  GG+theme(axis.title = element_text(size=8),
+           axis.text = element_text(size=6),
+           plot.title=element_blank(),
+           legend.title = element_blank(),
+           legend.text = element_text(size=6))
+}
+
+PL.diet.bc.2<-small_fig2(PL.diet.bc+theme_bw())
+PL.strat.bc.2<-small_fig2(PL.strat.bc+theme_bw())
+PL.bw.bc.2<-small_fig2(PL.bw.bc+theme_bw())
+
+Grid.bc<-
+ggarrange(PL.diet.bc.2+theme(legend.position = "bottom")+ggtitle("A)"),
+          PL.strat.bc.2+theme(legend.position = "bottom")+ggtitle("B)"),
+          PL.bw.bc.2+theme(legend.position = "bottom")+ggtitle("C)"),
+          nrow = 3)
+
+ggsave(Grid.bc,file="results/Beta_bc_pic_PCoA.pdf",width = 8, height=18,units="cm")
+
+Grid.bc
+
+```
+
+# dbRDA  for Hydromys species
+
+```{r fig.height=12, fig.width=8}
+
+# prepare data.frame for analyses
+ORD.df$Species2<-ORD.df$Species_consensus_ddRAD_mt_others
+ORD.df$Species2<-gsub(" ",".",ORD.df$Species2)
+
+# Cophenetic phylogenetic distances + select relevant axes 
+PHYLO.coph<-cophenetic(HYDRO.p.unq.u)
+PHYLO.coph.m<-pcoa(PHYLO.coph)
+PHYLO.coph.m$values #First 5 axes exceed broken stick 
+
+PHYLO.coph.df<-data.frame(PHYLO.coph.m$vectors)
+NAMES<-colnames(as.matrix(Bray))
+NAMES<-gsub(" ",".",NAMES)
+PHYLO.coph.df<-PHYLO.coph.df[NAMES,]
+#rownames(PHYLO.coph.df)==NAMES
+
+# Null model vs Full + forward selection of relevant axes
+# all 5 axes significant 
+rda_null <- dbrda(Bray ~ 1, data = PHYLO.coph.df[,1:5])
+rda_full <- dbrda(Bray ~ ., data = PHYLO.coph.df[,1:5])
+rda_selected <- ordiR2step(rda_null, scope = formula(rda_full), trace = F)
+anova(rda_selected , by="margin") 
+summary(rda_selected)
+
+
+#####Data frame for analyses#####
+nperm=999
+#ORD.df$Species2==rownames(PHYLO.coph.df)
+ORD.df.2<-data.frame(ORD.df,PHYLO.coph.df[,1:5])
+
+
+####Models for Bray-Curtis
+a.bc.nf<-dbrda(Bray ~ Diet+Strata+Body_mass, data = ORD.df.2) #non-phylogenetic model
+a.bc.f<-dbrda(Bray ~ Condition(Axis.1+Axis.2+Axis.3+Axis.4+Axis.5)+
+                Diet+Strata+Body_mass, data = ORD.df.2) # phylogenetic model
+
+
+# Table for phylogeny (based on model comparission)
+tab_comp <- as.data.frame(anova(a.bc.nf, a.bc.f, permutations = nperm))
+comp_row <- tab_comp[nrow(tab_comp), , drop = FALSE]
+
+# Table for other predictors (after control for phylogeny - marginal testing)
+joint_result <- data.frame(
+  Term = "Phylogeny",
+  Df = as.numeric(comp_row[["Df"]]),
+  F = as.numeric(comp_row[["F"]]),
+  P = as.numeric(comp_row[["Pr(>F)"]]),
+  R2_effect = as.numeric(a.bc.f$pCCA$tot.chi / a.bc.f$tot.chi)
+)
+
+tab_margin <- as.data.frame(anova(a.bc.f, by = "margin", permutations = nperm))
+total_inertia <- a.bc.f$tot.chi
+unconditioned_inertia <- a.bc.f$CCA$tot.chi + a.bc.f$CA$tot.chi
+tab_effects <- tab_margin[rownames(tab_margin) != "Residual", , drop = FALSE]
+
+# 5. Build results table
+marginal_results <- data.frame(
+  Term = rownames(tab_effects),
+  Df = as.numeric(tab_effects[["Df"]]),
+  F = as.numeric(tab_effects[["F"]]),
+  P = as.numeric(tab_effects[["Pr(>F)"]]),
+  #SS = as.numeric(tab_effects[[ss_col]]),
+  R2_effect = as.numeric(tab_effects[["SumOfSqs"]]) / total_inertia,
+  #R2_unconditioned = as.numeric(tab_effects[[ss_col]]) / unconditioned_inertia,
+  row.names = NULL
+)
+
+results <- rbind(joint_result, marginal_results)
+results.bc.f<-results
+
+# table for non-phylogenetic model
+tab_margin.nf <- as.data.frame(anova(a.bc.nf, by = "margin", permutations = nperm))
+tab_margin.nf <- tab_margin.nf[rownames(tab_margin.nf) != "Residual",, drop = FALSE]
+total_inertia <- a.bc.nf$tot.chi
+
+marginal_results <- data.frame(
+  Term = rownames(tab_margin.nf),
+  Df = as.numeric(tab_margin.nf[["Df"]]),
+  F = as.numeric(tab_margin.nf[["F"]]),
+  P = as.numeric(tab_margin.nf[["Pr(>F)"]]),
+  R2_effect = as.numeric(tab_margin.nf[["SumOfSqs"]]) / total_inertia,
+  row.names = NULL
+)
+
+results.bc.nf<-rbind(c("Phylogeny","","","",""),
+                    marginal_results)
+
+#### Final table
+DF.rda<-
+data.frame(Response=c("Metagenomes","","",""),
+           rbind(results.bc.nf),
+           rbind(results.bc.f[,2:5]))
+
+write.table(DF.rda, file="results/RDA_table_Picrust.txt",
+            sep="\t",row.names = F, quote = F)
+DF.rda
+```
+
+
+
+# LinDA - differential abundance analysis for Hydromys species
+
+```{r fig.height=12, fig.width=8}
+
+#phyloseg
+PHS.pic_path
+taxa_table<-data.frame(otu_table(PHS.pic_path))
+rownames(taxa_table)<-as.character(tax_table(PHS.pic_path)[,2])
+metadata<-data.frame(sample_data(PHS.pic_path))
+
+class(taxa_table)<-"data.frame"
+class(metadata)<-"data.frame"
+
+metadata$Species_consensus_ddRAD_mt_others<-as.factor(metadata$Species_consensus_ddRAD_mt_others)
+metadata$Body_mass
+metadata$Alt.Z<-scale(metadata$Alt)
+metadata$Body_mass.Z<-scale(metadata$Body_mass)
+metadata$Metalokalita[metadata$Metalokalita%in%c("Nagada","Wanang","Baitabag")]<-"Mt_Wilhelm"
+metadata$Diet<-factor(metadata$Diet,levels=c("herbivore","omnivore","carnivore"))
+
+Linda_iR.nR.G<-
+  linda(
+    feature.dat=(as.matrix(taxa_table)),
+    meta.dat=metadata,
+    formula="~Run+Metalokalita+Body_mass.Z+Strata+Alt.Z+Diet+
+    (1|Species_consensus_ddRAD_mt_others)+(1|Locality)",
+    feature.dat.type = c('count', 'proportion'),
+    prev.filter = 0.1,
+    mean.abund.filter = 0, 
+    max.abund.filter = 0,
+    is.winsor = FALSE,
+    outlier.pct = 0.03,
+    adaptive = TRUE,
+    zero.handling = c('pseudo-count', 'imputation'),
+    pseudo.cnt = 0.5,
+    corr.cut = 0.1,
+    p.adj.method = "BH",
+    alpha = 0.05,
+    n.cores = 1, 
+    verbose = TRUE
+  )
+
+##results###
+Linda_long<-function(LINDA){
+  long_results <- bind_rows(
+  lapply(names(LINDA$output), function(varname) {
+    df <- as.data.frame(LINDA$output[[varname]])
+    # ensure taxa are a column (rownames in output correspond to taxa)
+    df$taxon <- rownames(df)
+    df$variable <- varname
+    # keep columns you want; adjust/select more if desired
+    df %>% dplyr::select(taxon, variable, baseMean, log2FoldChange, lfcSE, stat, pvalue, padj, reject, df)
+  }),
+  .id = NULL
+) %>%
+  arrange(taxon, variable)
+long_results
+} 
+
+Linda_res<-Linda_long(LINDA=Linda_iR.nR.G)
+Linda_res<-Linda_res[grep("^Run",Linda_res$variable,invert = T),]
+
+tapply(Linda_res$pvalue<0.05,Linda_res$variable,sum)
+
+SELECT<-unique(Linda_res$taxon[Linda_res$padj<0.05])
+
+Linda_res_SIG<-Linda_res[Linda_res$taxon%in%SELECT,]
+SIG_MAT<-Linda_res_SIG[,c("taxon","variable","padj")]
+EFF_MAT<-Linda_res_SIG[,c("taxon","variable","log2FoldChange")]
+SIG_MAT.w<-reshape(SIG_MAT, idvar = "taxon", timevar = "variable", direction = "wide")
+EFF_MAT.w<-reshape(EFF_MAT, idvar = "taxon", timevar = "variable", direction = "wide")
+rownames(SIG_MAT.w)<-SIG_MAT.w$taxon
+rownames(EFF_MAT.w)<-EFF_MAT.w$taxon
+
+EFF_MAT.w<-EFF_MAT.w[,2:dim(EFF_MAT.w)[2]]
+SIG_MAT.w<-SIG_MAT.w[,2:dim(SIG_MAT.w)[2]]
+EFF_MAT.w[SIG_MAT.w>0.05]<-0
+
+EFF_MAT.w.eff<-EFF_MAT.w
+EFF_MAT.w.eff[abs(EFF_MAT.w.eff)<2]<-0
+colSums(EFF_MAT.w.eff!=0)
+colSums(EFF_MAT.w!=0)
+
+colnames(EFF_MAT.w)<-gsub("log2FoldChange.","",colnames(EFF_MAT.w))
+colnames(EFF_MAT.w.eff)<-gsub("log2FoldChange.","",colnames(EFF_MAT.w))
+
+EFF_MAT.w.eff<-EFF_MAT.w.eff[rowSums(abs(EFF_MAT.w.eff))!=0,]
+dim(EFF_MAT.w.eff)
+
+library(circlize)
+col_fun <- colorRamp2(
+  c(min(as.matrix(EFF_MAT.w.eff)), 0, max(as.matrix(EFF_MAT.w.eff))),    # value breaks
+  c("blue","grey80", "red")    # corresponding colors
+)
+
+colnames(EFF_MAT.w.eff)<-c("Elevation", "Body mass", "Herbivores x Carnivores", "Herbivores x Omnivore" ," Finisterres x Mt. Wilhelm","Scansorial x Terrestrial")
+
+colnames(EFF_MAT.w)<-c("Elevation", "Body mass", "Herbivores x Carnivores", "Herbivores x Omnivore" ," Finisterres x Mt. Wilhelm","Scansorial x Terrestrial")
+
+# only pathways with |l2fc| > 2 reretained
+pdf(file = "results/Hydro_Linda_pic_lfc2.pdf", width=18/2.54, height=17/2.54)
+  ComplexHeatmap::Heatmap(as.matrix(EFF_MAT.w.eff),
+                          cluster_columns = FALSE,
+                          column_names_gp = gpar(fontsize = 6),
+                          row_names_gp = gpar(fontsize = 6),
+                          col = col_fun,
+                          row_names_max_width = unit(10, "cm"),
+                          heatmap_legend_param = list(title = NULL,
+                                                      legend_direction = "horizontal",
+                                                      labels_gp=gpar(fontsize = 6))) |>
+  draw(heatmap_legend_side = "bottom")
+dev.off()
+
+
+# heatmap for all significant pathways (fdr < 0.05)
+
+pdf(file = "results/Hydro_Linda_pic.pdf", width=18/2.54, height=25/2.54)
+  ComplexHeatmap::Heatmap(as.matrix(EFF_MAT.w),
+                          cluster_columns = FALSE,
+                          column_names_gp = gpar(fontsize = 6),
+                          row_names_gp = gpar(fontsize = 6),
+                          col = col_fun,
+                          row_names_max_width = unit(10, "cm"),
+                          heatmap_legend_param = list(title = NULL,
+                                                      legend_direction = "horizontal",
+                                                      labels_gp=gpar(fontsize = 6))) |>
+  draw(heatmap_legend_side = "bottom")
+dev.off()
+
+
+
+colSums(EFF_MAT.w.eff!=0)
+colSums(EFF_MAT.w!=0)
+# sum(EFF_MAT.w.eff$`Herbivores x Carnivores`>0)
+sum(EFF_MAT.w.eff$`Herbivores x Carnivores`<0)
+```
+

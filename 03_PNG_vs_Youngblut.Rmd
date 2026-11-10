@@ -1,0 +1,690 @@
+---
+title: "Untitled"
+output: html_document
+date: "2026-10-16"
+---
+
+This script compares gut microbiota data from Papua New Guinea (PNG) Hydromyini with the reference dataset from Youngblut et al. (2019): https://www.nature.com/articles/s41467-019-10191-3
+
+
+# Packages and functions
+
+```{r }
+library(dada2)
+library(ggplot2)
+library(ShortRead)
+library(phyloseq)
+library(readxl)
+library(plyr)
+library(vegan)
+library(ggplot2)
+library(ggplot2)
+library(dplyr)
+library(rstatix) 
+library(ggpubr)
+library(microViz)
+library(ggh4x)
+library(ggtext)
+library(ggpubr)
+
+small_fig<-function(GG){
+  GG+theme(axis.title = element_text(size=8),
+           axis.text = element_text(size=6),
+           plot.title=element_text(size=8),
+           legend.text = element_text(size=8),
+           legend.key.size = unit(0.5,"line"))
+}
+
+manage_unassigned<-function(PHYLOSEQ,UNASS_STRING=NA,ADD,AFTER=TRUE){
+  TAXall<-data.frame(tax_table(PHYLOSEQ),stringsAsFactors = F)
+  if(!is.na(UNASS_STRING)){TAXall[UNASS_STRING]<-NA}
+  # TAXall<-as.character(TAXall[i,])
+  for(i in 1:dim(TAXall)[1]){  
+    TAX<-as.character(TAXall[i,])
+    if(AFTER==TRUE) {for(j in 2: length(TAX)){
+      if(is.na(TAX[j])){TAX[j]<-ifelse(regexpr(ADD,TAX[j-1])>0,
+                                       TAX[j-1],paste(TAX[j-1],ADD,sep=""))}}}
+    if(AFTER==FALSE) {for(j in 2: length(TAX)){
+      if(is.na(TAX[j])){TAX[j]<-ifelse(regexpr(ADD,TAX[j-1])>0,
+                                       TAX[j-1],ADD,paste(TAX[j-1],sep=""))}}}
+    TAXall[i,]<-TAX
+  }
+  TAXA<-colnames(TAXall)
+  SPECIES<-rownames(TAXall)
+  TAXall<-tax_table(TAXall)
+  taxa_names(TAXall)<-SPECIES
+  colnames(TAXall)<-TAXA
+  tax_table(PHYLOSEQ)<-TAXall
+  
+  #output
+  PHYLOSEQ
+}
+
+
+prepare_tax_df<-function(PHYLOSEQ,RANK,Unass.symbol=NA,Unass.repl,
+                         min_prop,top_tax,bellow_top,
+                         merge_categories,prop.trans,sort_abu){
+  if(prop.trans==T){PHYLOSEQ=transform_sample_counts(PHYLOSEQ,function(x) x/sum(x))}
+  TT<-tax_table(PHYLOSEQ)
+  class(TT)<-"matrix"
+  TT[is.na(tax_table(TT))]<-Unass.repl
+  TT<-tax_table(TT)
+  tax_table(PHYLOSEQ)<-TT
+  
+  PHYLOSEQ.merged<-tax_glom(PHYLOSEQ,taxrank=RANK)
+  PHYLOSEQ.merged=transform_sample_counts(PHYLOSEQ.merged,function(x) x/sum(x))
+  
+  #select top taxa
+  NAMES<-as.character(tax_table(PHYLOSEQ.merged)[,RANK])
+  TS<-taxa_sums(PHYLOSEQ.merged)
+  names(TS)<-NAMES
+  TS<-rev(sort(TS))
+  KEEP<-names(TS)[1:top_tax]
+  
+  #
+  TT<-tax_table(PHYLOSEQ.merged)
+  class(TT)<-"matrix"
+  TT[,RANK][!TT[,RANK]%in%KEEP]<-bellow_top
+  TT<-tax_table(TT)
+  tax_table(PHYLOSEQ.merged)<-TT
+  PHYLOSEQ.merged<-tax_glom(PHYLOSEQ.merged,taxrank=RANK)
+  
+  mdf = psmelt(PHYLOSEQ.merged)
+  
+  if(sort_abu==T){
+    mdf[,RANK]<-as.factor(mdf[,RANK])
+    ADD<-levels(mdf[,RANK])[!levels(mdf[,RANK])%in%KEEP]
+    if(length(ADD)>0){mdf[,RANK]<-factor(mdf[,RANK],levels=c(KEEP,ADD))}
+    if(length(ADD)==0){mdf[,RANK]<-factor(mdf[,RANK],levels=c(KEEP))}
+  }
+  
+  mdf
+}
+
+```
+
+
+# Download from ENA
+
+- Primary data from Youngblut et al. (2019): https://www.nature.com/articles/s41467-019-10191-3
+- Unix commands
+```{r }
+# DATA DOWNLOAD
+# curl -s "https://www.ebi.ac.uk/ena/portal/api/filereport?accession=PRJEB29403&result=read_run&fields=study_accession,sample_accession,secondary_sample_accession,experiment_accession,run_accession,sample_alias,sample_title,scientific_name,tax_id,library_strategy,library_layout,instrument_model,read_count,base_count,fastq_ftp,fastq_md5,fastq_bytes&format=tsv&download=true" -o PRJEB29403_metadata.tsv
+# tail -n +2 PRJEB29403_metadata.tsv | cut -f 15 | tr ';' '\n' | sed 's/^/ftp:\/\//' > fastq_urls.txt
+# aria2c -j 8 -i fastq_urls.txt
+
+```
+
+# Quality filtering and trimming
+
+```{r }
+# ############ 242113669_data
+# setwd("~/data/PNG_bact/Youngblut_ref_data/SEQ_DATA/00.RAW_DATA/")
+# list.files()
+# 
+# LIST<-list.files()
+# LIST
+# F_reads<-LIST[grep("_1.fastq.gz",LIST)]
+# R_reads<-LIST[grep("_2.fastq.gz",LIST)]
+# 
+# ##read length#####
+# LL<-as.numeric()
+# for(i in 1:length(F_reads)){
+#   FQ<-readFastq(F_reads[i])
+#   LL<-c(LL,width(FQ))
+# 
+# }
+# LL.f<-LL
+# summary(LL.f)
+# quantile(LL.f,0.05) # 251 bp
+# 
+# 
+# LL<-as.numeric()
+# NUMSEQ<-as.numeric()
+# for(i in 1:length(R_reads)){
+#   FQ<-readFastq(R_reads[i])
+#   LL<-c(LL,width(FQ))
+#   NUMSEQ[i]<-length(FQ)
+# 
+# }
+# 
+# LL.r<-LL
+# summary(LL.r)
+# quantile(LL.r,0.05) # 251 bp
+# 
+# qp.f<-plotQualityProfile(F_reads[NUMSEQ>1000], aggregate = T)+ggtitle("Forward reads")
+# qp.r<-plotQualityProfile(R_reads[NUMSEQ>1000], aggregate = T)+ggtitle("Reverse reads")
+# 
+# ggsave(qp.f,filename = "~/data/PNG_bact/Youngblut_ref_data/RESULTS/qp.f.pdf")
+# ggsave(qp.r,filename = "~/data/PNG_bact/Youngblut_ref_data/RESULTS/qp.r.pdf")
+# 
+# sample.names<-gsub("_1.fastq.gz","",F_reads)
+# tail(sample.names)
+# 
+# #POD TEMITO JMENY SE BUDOU UKLADAT FILTROVANE SOUBORY
+# filtFs <- paste0(sample.names, "_READ1_filt.fastq.gz")
+# filtRs <- paste0(sample.names, "_READ2_filt.fastq.gz")
+# tail(filtRs)
+# #FILTROVANI
+# #MAXIMALNI PREDPIKLADANY POCET CHYB - 2
+# 
+# #zkousim trimovat 200 + 150
+# 
+# for(x in 1:length(F_reads)) {
+#   print(sample.names[x])
+#   fastqPairedFilter(c(F_reads[x], R_reads[x]), c(filtFs[x], filtRs[x]),
+#                     maxN=0, maxEE=2, minQ=2,truncQ=2,
+#                     compress=TRUE, verbose=TRUE,
+#                     minLen = c(200,150),truncLen = c(200,150))
+# }
+
+```
+
+
+# Denoising 
+
+- Done on remote cluster 
+- same steps as for the main dataset
+
+```{r }
+# #!/usr/bin/Rscript
+# 
+# #####for binned quality scores ~ makeBinnedQualErrfun
+# ##https://github.com/benjjneb/dada2/issues/1307
+# 
+# library(dada2)
+# # library(ggplot)
+# 
+# #PATH
+# ID<-readLines("../JOB")
+# ID<-gsub("/scratch.ssd/kreising/","",ID)
+# 
+# #Read fastq
+# fns <- list.files()
+# fastqs <- fns[grepl(".fastq.gz$", fns)]
+# fastqs <- sort(fastqs)
+# 
+# fnFs <- fastqs[grepl("_READ1_filt.fastq.gz", fastqs)]
+# fnRs <- fastqs[grepl("_READ2_filt.fastq.gz", fastqs)]
+# 
+# sample.names <- gsub("_READ1_filt.fastq.gz","",fnFs)
+# 
+# #dereplicate
+# derepFs <- derepFastq(fnFs,n = 1e+06, verbose=T)
+# derepRs <- derepFastq(fnRs,n = 1e+06, verbose=T)
+# 
+# #Errors
+# #binnedQs <- c(2,11,25,37) #tohle je kodovani podle aktualnich hodnot - dava to pomerne dobry smysl (az na vyjimky)
+# #binnedQualErrfun <- makeBinnedQualErrfun(binnedQs)
+# 
+# #errF <- learnErrors(fnFs, errorEstimationFunction=binnedQualErrfun, multi=TRUE,randomize=TRUE,MAX_CONSIST = 25)
+# #errR <- learnErrors(fnRs, errorEstimationFunction=binnedQualErrfun, multi=TRUE,randomize=TRUE,MAX_CONSIST = 25)
+# errF <- learnErrors(fnFs, multithread=TRUE,MAX_CONSIST = 25)
+# errR <- learnErrors(fnRs, multithread=TRUE,MAX_CONSIST = 25)
+# 
+# dada_err.F<-plotErrors(errF, nominalQ=TRUE)
+# dada_err.R<-plotErrors(errR, nominalQ=TRUE)
+# 
+# dadaFs <- dada(derepFs,err=errF,multithread = T,pool = "pseudo",verbose = TRUE,MAX_CONSIST = 25)
+# dadaRs <- dada(derepRs,err=errR,multithread = T,pool = "pseudo",verbose = TRUE,MAX_CONSIST = 25)
+# 
+# #SPOJENI READU
+# mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, verbose=TRUE, minOverlap = 10,maxMismatch=0,justConcatenate=F)
+# 
+# #VYSLEDNA TABULKA
+# seqtab <- makeSequenceTable(mergers)
+# 
+# #ulozit vysledky
+# save(seqtab,    file=paste0("/storage/brno2/home/kreising/DADA_RES/otutab_pseudo_",ID,".R"))
+# save(dada_err.F,file=paste0("/storage/brno2/home/kreising/DADA_RES/dada_err.F_pseudo_",ID,".R"))
+# save(dada_err.R,file=paste0("/storage/brno2/home/kreising/DADA_RES/dada_err.R_pseudo_",ID,".R"))
+
+
+```
+
+# Removal of chimeric sequences Youngblut
+
+```{r }
+# ############Phyloseq
+# #based on binned ASV table
+# library(dada2)
+# load("~/data/PNG_bact/Youngblut_ref_data/SEQ_DATA/PHSQ/otutab_pseudo_job_24655660.pbs-m1.R")
+# dim(seqtab)
+# 
+# seqtab.nch<-removeBimeraDenovo(seqtab,verbose = T, method = "consensus")
+# save(seqtab.nch,file = "~/data/PNG_bact/Youngblut_ref_data/SEQ_DATA/PHSQ/otutab_pseudo_job_24655660.pbs-m1_nch.R")
+# sum(seqtab.nch)/sum(seqtab)
+
+```
+
+# Taxonomy
+
+```{r }
+
+# #TAXONOMY
+# tax50<-assignTaxonomy(colnames(seqtab.nch),refFasta = "~/DB/silva_nr99_v138.2_toGenus_trainset.fa.gz",
+#                       minBoot = 50)
+# tax80<-assignTaxonomy(colnames(seqtab.nch),refFasta = "~/DB/silva_nr99_v138.2_toGenus_trainset.fa.gz",
+#                       minBoot = 80)
+# 
+# save(tax50,file = "~/data/PNG_bact/Youngblut_ref_data/SEQ_DATA/PHSQ/tax50.R")
+# save(tax80,file = "~/data/PNG_bact/Youngblut_ref_data/SEQ_DATA/PHSQ/tax80.R")
+
+
+```
+
+# Phyloseq database for 
+- PRJEB29403_metadata.tsv: this is a table associated with the ENA project that was build within the first step
+- 41467_2019_10191_MOESM5_ESM.xlsx: Table S1 from the Youngblut et al. (2019) article
+
+```{r }
+# ###################
+# # Step 1: Metadata#
+# ###################
+#  
+# ### From ENA
+# ENA.meta<-read.delim("~/data/PNG_bact/Youngblut_ref_data/SEQ_DATA/PRJEB29403_metadata.tsv")
+# # View(ENA.meta)
+# 
+# ### From paper (Table S1)
+# 
+# PAP_meta<-read_xlsx("~/data/PNG_bact/Youngblut_ref_data/SEQ_DATA/41467_2019_10191_MOESM5_ESM.xlsx")
+# # View(PAP_meta)
+# 
+# Species_ENA<-gsub("^[A-Za-z0-9]*_","",ENA.meta$sample_title)
+# Species_PAP<-gsub("^[A-Za-z0-9]*[.]","",PAP_meta$sample_ID)
+# Species_PAP<-gsub("[.]","_",Species_PAP)
+# 
+# Species_ENA<-ENA.meta$sample_title
+# Species_PAP<-PAP_meta$sample_ID
+# Species_PAP<-gsub("[.]","_",Species_PAP)
+# Species_PAP<-gsub("^X","",Species_PAP)
+# 
+# # sum(!Species_PAP%in%Species_ENA) # all samples present in both tables
+# # sum(!Species_ENA%in%Species_PAP)
+# # sum(duplicated(Species_ENA))
+# 
+# ENA.meta$SAMPLE<-Species_ENA
+# PAP_meta$SAMPLE<-Species_PAP
+# 
+# # merging both tables
+# META_join<-join(ENA.meta,PAP_meta)
+# META_join$host_taxonomy_class
+# # View(META_join)
+# 
+# #####################
+# # Step 2: ASV matrix#
+# #####################
+# load("~/data/PNG_bact/Youngblut_ref_data/SEQ_DATA/PHSQ/otutab_pseudo_job_24655660.pbs-m1_nch.R")
+# OT<-otu_table(seqtab.nch,taxa_are_rows = F)
+# sample_names(OT)<-gsub("_READ1_filt.fastq.gz","",sample_names(OT))
+# 
+# #####################
+# # Step 3: Tax. table#
+# #####################
+# 
+# load("~/data/PNG_bact/Youngblut_ref_data/SEQ_DATA/PHSQ/tax50.R")
+# TT<-tax_table(tax50)
+# 
+# ####################
+# # Step 4: ASC fasta#
+# ####################
+# 
+# FASTA<-DNAStringSet(taxa_names(OT))
+# names(FASTA)<-taxa_names(OT)
+# 
+# SD<-sample_data(META_join)
+# sample_names(SD)<-SD$run_accession
+# 
+# ###################
+# # Step 5: Phyloseq#
+# ###################
+# PHS<-merge_phyloseq(OT,TT,FASTA,SD)
+# 
+# #Phyloseq - edits
+# 
+# #########################
+# # Step 6: Phyloseq edits#
+# #########################
+# 
+# # Removing
+# #1 non-mammalian samples
+# #2 AVS without phylum identity
+# #3 Chloroplasts + Mitochondria
+# 
+# # Than group ASVs to  Family-level bins
+# PHS.mam<-prune_samples(sample_data(PHS)$host_taxonomy_class=="Mammalia",
+#                        PHS)
+# 
+# 
+# F1<-as.logical(is.na(TT[,"Phylum"]))
+# F2<-as.logical(TT[,"Order"]=="Chloroplast")
+# F2[is.na(F2)]<-F
+# F3<-as.logical(TT[,"Family"]=="Mitochondria")
+# F3[is.na(F3)]<-F
+# 
+# FF<-F1+F2+F2==0
+# sum(FF)
+# 
+# PHS.mam<-prune_taxa(FF,PHS.mam)
+# PHS.mam<-manage_unassigned(PHYLOSEQ=PHS.mam,UNASS_STRING=NA,ADD="",AFTER=TRUE)
+# 
+# SD.unq<-sample_data(PHS.mam)
+# SD.unq<-SD.unq[!duplicated(SD.unq$host_taxonomy_species),]
+# sample_names(SD.unq)<-SD.unq$host_taxonomy_species
+# PHS.mam.sp<- merge_samples(PHS.mam,"host_taxonomy_species") # Species-level
+# sample_data(PHS.mam.sp)<-SD.unq
+# 
+# PHS.mam.sp.fam<-tax_glom(PHS.mam.sp,"Family")
+# PHS.mam.sp.fam<-prune_taxa(as.character(tax_table(PHS.mam.sp.fam)[,"Family"])!="Incertae Sedis",
+#                            PHS.mam.sp.fam)# remove "Incertae Sedis"
+# 
+# taxa_names(PHS.mam.sp.fam)<-as.character(tax_table(PHS.mam.sp.fam)[,"Family"])
+# 
+# save(PHS.mam.sp.fam,file = "data/PHS.mam.sp.fam.Rdata")
+
+```
+
+# Merge data on PNG rodents with Youngblut et al. (2019)
+
+```{r }
+##########################
+#1a: Youngblut data#######
+##########################
+
+load("data/PHS.mam.sp.fam.Rdata")
+
+##########################
+#1b: PNG data#############
+##########################
+
+#- keep Hydromyni samples
+#- Merge samples according to host species identity
+#- Create family-level ASV binc
+
+load("data/PHS.rodents.ASV_Meta_Decont_final.R")
+PHS.h<-prune_samples(sample_data(PHS)$Tribe.2=="Hydromyini",
+                     PHS)
+
+SD.unq<-sample_data(PHS.h)
+SD.unq<-SD.unq[!duplicated(SD.unq$Species_consensus_ddRAD_mt_others),]
+sample_names(SD.unq)<-SD.unq$Species_consensus_ddRAD_mt_others
+PHS.h.sp<-merge_samples(PHS.h,"Species_consensus_ddRAD_mt_others")
+sample_data(PHS.h.sp)<-SD.unq
+
+#familylevel
+PHS.h.sp.f<-tax_glom(PHS.h.sp,"Family")
+PHS.h.sp.f<-prune_taxa(as.character(tax_table(PHS.h.sp.f)[,"Family"])!="Incertae Sedis",
+                       PHS.h.sp.f)# remove "Incertae Sedis"
+
+taxa_names(PHS.h.sp.f)<-as.character(tax_table(PHS.h.sp.f)[,"Family"])
+
+
+##############################
+#2: Metadata adjustments######
+##############################
+
+# Keep only relevant variables from PNG and Youngblut et al. (2019) phyloseq
+# Make metadata compatible
+
+PHS.h.sp.f2<-PHS.h.sp.f
+SD<-sample_data(PHS.h.sp.f2)
+names(sample_data(PHS.h.sp.f2))
+KEEP<-c("Species_consensus_ddRAD_mt_others","Diet")
+SD.sub<-SD[,KEEP]
+names(SD.sub)<-c("Host","Diet")
+sample_data(PHS.h.sp.f2)<-SD.sub
+sample_data(PHS.h.sp.f2)$Order<-"Rodentia"
+sample_data(PHS.h.sp.f2)$Family<-"Muridae"
+
+PHS.mam.sp.fam2<-PHS.mam.sp.fam
+SD<-sample_data(PHS.mam.sp.fam2)
+names(sample_data(PHS.mam.sp.fam2))
+KEEP<-c("host_taxonomy_species","diet","host_taxonomy_order","host_taxonomy_family")
+SD.sub<-SD[,KEEP]
+names(SD.sub)<-c("Host","Diet","Order","Family")
+SD.sub$Family<-ifelse(SD.sub$Family=="Muridae","Muridae","Others")
+SD.sub$Order<-ifelse(SD.sub$Order=="Rodentia","Rodentia","Others")
+sample_data(PHS.mam.sp.fam2)<-SD.sub
+
+sample_data(PHS.h.sp.f2)$Dataset<-"Hydromyni"
+sample_data(PHS.mam.sp.fam2)$Dataset<-"Mammals"
+
+
+PHS.merged<-merge_phyloseq(PHS.mam.sp.fam2,
+                           PHS.h.sp.f2)
+
+```
+
+# PCoA for Bray-Curtis dissimilarities
+
+- Dissimilarities calculated based on family-level, abundances converted to proportions 
+
+```{r }
+PHS.merged.t<-transform_sample_counts(PHS.merged,function(x) x/sum(x))
+BC<-vegdist(otu_table(PHS.merged.t)^0.5)
+ORD<-ordinate(PHS.merged.t,distance = BC, method = "PCoA")
+
+sample_data(PHS.merged.t)$Dataset2<-gsub("Mammals","Mammals (global dataset)",
+                                         sample_data(PHS.merged.t)$Dataset)
+
+gg_ORD<-
+plot_ordination(PHS.merged.t,ORD,color="Diet",shape="Family")+
+  facet_grid(.~Dataset2)
+
+gg_ORD.s<-small_fig(gg_ORD+theme_bw())+theme(legend.position = "bottom",
+                                             legend.box = "vertical",
+                                             legend.title = element_blank())+
+  xlab("PCoA.1 [27.7%]")+ylab("PCoA.2 [11.8%]")
+
+ggsave(gg_ORD.s,filename="results/PCoA_PNG_Youngblut.pdf",
+       width = 12, height = 12, units = "cm")
+
+gg_ORD.s
+
+```
+
+# Comparing dissimilarities among PNG Hydromyni and Youngblut species - stratified by dietary guilds
+
+```{r }
+
+# Extract relevant dissimilarity values from the matrix
+BC.m<-as.matrix(BC)
+SD.all<-data.frame(sample_data(PHS.merged.t))
+SD.Hydro<-SD.all[SD.all$Dataset=="Hydromyni",]
+SD.Young<-SD.all[SD.all$Dataset!="Hydromyni",]
+
+BC.m.sub<-BC.m[SD.all$Dataset=="Hydromyni",SD.all$Dataset!="Hydromyni"]
+
+# Dissimilarity values for each category
+Hydromyni.carniv_Mammals.carniv<-as.numeric(BC.m.sub[SD.Hydro$Diet=="carnivore", SD.Young$Diet=="carnivore"])
+Hydromyni.carniv_Mammals.omniv<-as.numeric(BC.m.sub[SD.Hydro$Diet=="carnivore", SD.Young$Diet=="omnivore"])
+Hydromyni.carniv_Mammals.herbiv<-as.numeric(BC.m.sub[SD.Hydro$Diet=="carnivore", SD.Young$Diet=="herbivore"])
+
+Hydromyni.omniv_Mammals.carniv<-as.numeric(BC.m.sub[SD.Hydro$Diet=="omnivore", SD.Young$Diet=="carnivore"])
+Hydromyni.omniv_Mammals.omniv<-as.numeric(BC.m.sub[SD.Hydro$Diet=="omnivore", SD.Young$Diet=="omnivore"])
+Hydromyni.omniv_Mammals.herbiv<-as.numeric(BC.m.sub[SD.Hydro$Diet=="omnivore", SD.Young$Diet=="herbivore"])
+
+Hydromyni.herbiv_Mammals.carniv<-as.numeric(BC.m.sub[SD.Hydro$Diet=="herbivore", SD.Young$Diet=="carnivore"])
+Hydromyni.herbiv_Mammals.omniv<-as.numeric(BC.m.sub[SD.Hydro$Diet=="herbivore", SD.Young$Diet=="omnivore"])
+Hydromyni.herbiv_Mammals.herbiv<-as.numeric(BC.m.sub[SD.Hydro$Diet=="herbivore", SD.Young$Diet=="herbivore"])
+
+# Data frame for analyses and vizualization
+Dissimilarity<-c(Hydromyni.carniv_Mammals.carniv,Hydromyni.carniv_Mammals.omniv,Hydromyni.carniv_Mammals.herbiv,
+                 Hydromyni.omniv_Mammals.carniv,Hydromyni.omniv_Mammals.omniv,Hydromyni.omniv_Mammals.herbiv,
+                 Hydromyni.herbiv_Mammals.carniv,Hydromyni.herbiv_Mammals.omniv,Hydromyni.herbiv_Mammals.herbiv)
+
+
+Hydromyni.diet<-c(
+  rep("carnivore",c(length(c(Hydromyni.carniv_Mammals.carniv,Hydromyni.carniv_Mammals.omniv,Hydromyni.carniv_Mammals.herbiv)))),
+  rep("omnivore",c(length(c(Hydromyni.omniv_Mammals.carniv,Hydromyni.omniv_Mammals.omniv,Hydromyni.omniv_Mammals.herbiv)))),
+  rep("herbivore",c(length(c(Hydromyni.herbiv_Mammals.carniv,Hydromyni.herbiv_Mammals.omniv,Hydromyni.herbiv_Mammals.herbiv))))
+)
+
+Mammalian.diet<-c(
+rep("carnivore",length(Hydromyni.carniv_Mammals.carniv)),
+rep("omnivore",length(Hydromyni.carniv_Mammals.omniv)),
+rep("herbivore",length(Hydromyni.carniv_Mammals.herbiv)),
+
+rep("carnivore",length(Hydromyni.omniv_Mammals.carniv)),
+rep("omnivore",length(Hydromyni.omniv_Mammals.omniv)),
+rep("herbivore",length(Hydromyni.omniv_Mammals.herbiv)),
+
+rep("carnivore",length(Hydromyni.herbiv_Mammals.carniv)),
+rep("omnivore",length(Hydromyni.herbiv_Mammals.omniv)),
+rep("herbivore",length(Hydromyni.herbiv_Mammals.herbiv)))
+
+DF_diet<-data.frame(Dissimilarity,Hydromyni.diet,Mammalian.diet)
+
+DF_diet$Mammalian.diet<-factor(DF_diet$Mammalian.diet,
+                               levels = c("carnivore","omnivore","herbivore"))
+DF_diet$Hydromyni.diet<-factor(DF_diet$Hydromyni.diet,
+                               levels = c("carnivore","omnivore","herbivore"))
+
+levels(DF_diet$Hydromyni.diet)<-c("Hydromyni carniv.",
+                                  "Hydromyni omniv.",
+                                  "Hydromyni herbiv.")
+
+levels(DF_diet$Mammalian.diet)<-c("Global\ncarniv.",
+                                  "Global\nomniv.",
+                                  "Global\nherbiv.")
+
+# Comparission: PNG x Youngblut guilsd
+# Based on Dunn tests 
+stat.test <- DF_diet %>%
+  group_by(Mammalian.diet) %>%
+  dunn_test(Dissimilarity ~ Hydromyni.diet, p.adjust.method = "bonferroni") %>%
+  add_y_position(step.increase = 0.25)
+
+stat.test_sig <- stat.test %>% 
+  filter(p.adj < 0.05)%>%
+  add_y_position(step.increase = 0.3)
+
+# Vizualization 
+GG_contrast<-
+ggplot(DF_diet, aes(y = Dissimilarity, x = Hydromyni.diet, color = Hydromyni.diet)) +
+  geom_boxplot(outlier.shape = NA, width = 0.6) +
+  geom_jitter(alpha = 0.1, width = 0.2,size=0.5) +
+  facet_grid(Mammalian.diet ~ .) +
+  # Add horizontal comparison lines and significance labels
+  stat_pvalue_manual(
+    stat.test_sig,
+    #label = "p.adj.signif"
+    hide.ns = TRUE,
+    tip.length = 0.01
+  )
+
+GG_contrast<-GG_contrast+scale_color_manual(values = c("#F8766D", "#619CFF", "#00BA38"))
+
+GG_contrast.s<-small_fig(GG_contrast+theme_bw())
+GG_contrast.s<-GG_contrast.s+theme(strip.text = element_text(size=8),
+                                   axis.title.x = element_blank(),
+                                   axis.text.x = element_text(angle = 45, hjust = 1),
+                                   legend.position = "none")
+
+GG_contrast.s<-GG_contrast.s+ylim(c(0.35,1.25))
+ggsave(GG_contrast.s,filename="results/BoxPlots_PNG_Youngblut.pdf",
+       width = 12, height = 12, units = "cm")
+
+GG_contrast.s
+
+
+
+```
+
+# Barplots for dominant families
+
+```{r }
+library(Polychrome)
+P25 <-distinct_palette(n = 22, add = NA)
+P25<- unname(glasbey.colors(n = 23))
+P25<-P25[2:22]
+DF.genus.s<-prepare_tax_df(PHYLOSEQ=PHS.merged.t,
+                           RANK="Family",Unass.symbol=NA,
+                           Unass.repl="Unassigned",min_prop=NULL,top_tax=20,
+                           bellow_top="Others",merge_categories=NULL,
+                           prop.trans=TRUE,sort_abu=TRUE)
+
+LEV<-names(rev(sort(tapply(DF.genus.s$Abundance,DF.genus.s$Family,mean))))
+LEV
+DF.genus.s$Family<-as.factor(DF.genus.s$Family)
+DF.genus.s$Family<-factor(DF.genus.s$Family,levels = LEV)
+
+DF.genus.s$Diet2<-DF.genus.s$Diet
+DF.genus.s$Diet2<-gsub("vore","v.",DF.genus.s$Diet2)
+DF.genus.s$Diet2<-factor(DF.genus.s$Diet2,
+                         levels=c("carniv.","omniv.","herbiv."))
+
+DF.genus.s$Dataset2<-DF.genus.s$Dataset
+DF.genus.s$Dataset2<-gsub("Mammals","Mammals (global dataset)",DF.genus.s$Dataset2)
+
+DF.genus.s$Host<-gsub("_"," ",DF.genus.s$Host)
+DF.genus.s$Host_styled <- ifelse(
+  DF.genus.s$sample_Family == "Muridae",
+  paste0("<span style='color:red;'><b>", DF.genus.s$Host, "</b></span>"),
+  DF.genus.s$Host
+)
+
+names(P25)<-levels(DF.genus.s$Family)
+P25[names(P25)=="Others"]<-"gray80"
+
+# 2. Build your plot using "Host_styled" on the x-axis
+ta3 <- ggplot(DF.genus.s, aes(x = Host_styled, y = Abundance, fill = Family)) +
+  geom_bar(stat = "identity", position = "stack") +
+  facet_nested(. ~ Dataset2 + Diet2, scales = "free", space = "free") +
+  scale_fill_manual(values = P25) +
+  theme_bw(base_size = 12) +
+  theme(
+    axis.title.x = element_blank(),
+    axis.text.y  = element_text(size = 8, hjust = 0),
+    axis.title.y = element_text(size = 8),
+    strip.text   = element_text(size = 8),
+    legend.title = element_blank(),
+    legend.position = "bottom",
+    panel.spacing = unit(0.0, "lines"),
+    # Use element_markdown() to render the HTML spans
+    axis.text.x = element_markdown(
+      angle = 90, 
+      vjust = 0.5, 
+      hjust = 1, 
+      size  = 6
+    )
+  )
+
+ta3.s<-small_fig(ta3)
+ta3.s.family<-ta3.s+theme(strip.text = element_text(size=8),
+                                axis.text.y = element_text(size=8),
+                          axis.text.x = element_markdown(size = 5),
+                                 axis.title.y = element_text(size=8),
+                                 legend.title = element_blank(),
+                                 legend.position = "bottom",
+                                 panel.spacing = unit(0.0, "lines"))
+
+
+ggsave(ta3.s.family,filename="results/Taxplot_PNG_Youngblut.pdf",
+       width = 18, height = 12, units = "cm")
+
+ta3.s.family
+
+```
+
+# Final plot for the manuscript
+
+```{r }
+
+GRID.1<-
+ggarrange(gg_ORD.s+ggtitle("B)"),
+          GG_contrast.s+ggtitle("C)"),
+          ncol=2)
+
+GRID<-ggarrange(ta3.s.family+ggtitle("A)"),
+                GRID.1,
+                nrow = 2,
+                heights = c(1.2,1))
+
+ggsave(GRID,filename="results/PNG_Youngblut_compare.pdf",
+       width=18,height = 20,units = "cm")
+GRID
+
+```
